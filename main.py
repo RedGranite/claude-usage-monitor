@@ -42,7 +42,7 @@ import webbrowser
 # Version info — update this when releasing a new version
 # ---------------------------------------------------------------------------
 
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 GITHUB_REPO = "RedGranite/claude-usage-monitor"
 
 # ---------------------------------------------------------------------------
