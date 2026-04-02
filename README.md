@@ -15,6 +15,7 @@ A Windows system tray application that monitors your [Claude.ai](https://claude.
 ## Screenshot
 
 ![tray icon](https://img.shields.io/badge/tray-icon%20with%20percentage-blue) ![dashboard](https://img.shields.io/badge/dashboard-dark%20theme-1E1E1E)
+<img width="354" height="325" alt="image" src="https://github.com/user-attachments/assets/67862823-e8c1-4e21-b10e-8b41a2de3e34" />
 
 ## Download
 
