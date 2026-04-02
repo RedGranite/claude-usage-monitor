@@ -33,6 +33,16 @@ from config import load_config, save_config, CONFIG_DIR
 
 from typing import Optional
 import os
+import json
+import urllib.request
+import webbrowser
+
+# ---------------------------------------------------------------------------
+# Version info — update this when releasing a new version
+# ---------------------------------------------------------------------------
+
+APP_VERSION = "0.1"
+GITHUB_REPO = "RedGranite/claude-usage-monitor"
 
 # ---------------------------------------------------------------------------
 # Logging — writes to %APPDATA%/ClaudeUsageMonitor/debug.log
@@ -55,6 +65,43 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 LOCK_FILE = os.path.join(CONFIG_DIR, "instance.lock")
+
+
+def check_for_update():
+    """
+    Check GitHub Releases for a newer version.
+    Compares APP_VERSION with the latest release tag.
+    If a newer version exists, prompt the user to open the download page.
+    Runs silently on failure (no internet, GitHub down, etc.).
+    """
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "ClaudeUsageMonitor"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        latest_tag = data.get("tag_name", "").lstrip("v")
+        if not latest_tag:
+            return
+
+        # Simple version comparison (works for x.y or x.y.z)
+        def ver_tuple(v):
+            return tuple(int(x) for x in v.split("."))
+
+        if ver_tuple(latest_tag) > ver_tuple(APP_VERSION):
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            answer = messagebox.askyesno(
+                "Claude Usage Monitor — Update Available",
+                f"New version v{latest_tag} is available (current: v{APP_VERSION}).\n\n"
+                "Open the download page?",
+                parent=root,
+            )
+            root.destroy()
+            if answer:
+                webbrowser.open(data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases"))
+    except Exception:
+        pass  # Network error, no internet, etc. — skip silently
 
 
 def check_single_instance() -> bool:
@@ -261,6 +308,8 @@ class UsageMonitor:
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Refresh Now", self._on_refresh))
         items.append(pystray.MenuItem("Set Session Key...", self._on_set_key))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False))
         items.append(pystray.MenuItem("Quit", self._on_quit))
         return pystray.Menu(*items)
 
@@ -616,9 +665,12 @@ class UsageMonitor:
           4. Start background refresh + blink threads
           5. Run tray icon (blocks until quit)
         """
-        log.info("=== Claude Usage Monitor starting ===")
+        log.info(f"=== Claude Usage Monitor v{APP_VERSION} starting ===")
         log.info(f"Config: session_key={'set' if self.config['session_key'] else 'empty'}, org_id={self.config.get('org_id')}")
         log.info(f"Log file: {LOG_FILE}")
+
+        # Step 0: Check for updates on GitHub
+        check_for_update()
 
         # Step 1: Ensure we have a session key
         if not self.config["session_key"]:
