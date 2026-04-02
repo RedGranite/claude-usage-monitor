@@ -41,22 +41,40 @@ class ClaudeAPI:
                      claude.ai browser session (starts with "sk-ant-sid").
     """
 
+    # Chrome fingerprints to try, from newest to oldest.
+    # Available fingerprints vary by curl_cffi version.
+    _FINGERPRINTS = ("chrome136", "chrome131", "chrome124", "chrome120", "chrome")
+
     def __init__(self, session_key: str):
         self.session_key = session_key
+        self._fp_used = "unknown"
 
         # curl_cffi impersonates Chrome's TLS fingerprint to bypass Cloudflare.
         # Standard Python `requests` gets blocked with a 403 challenge page.
-        # Try the latest Chrome fingerprint, fall back to generic "chrome"
-        # if the specific version isn't available in the installed curl_cffi.
-        for fp in ("chrome136", "chrome131", "chrome124", "chrome120", "chrome"):
+        # Try the latest Chrome fingerprint, fall back to older ones.
+        for fp in self._FINGERPRINTS:
             try:
                 self.session = requests.Session(impersonate=fp)
+                self._fp_used = fp
                 break
             except Exception:
                 continue
+
+        # Headers that mimic a real Chrome browser visiting claude.ai.
+        # Cloudflare checks these in combination with the TLS fingerprint.
         self.session.headers.update({
-            "Accept": "application/json",
-            "Content-Type": "application/json",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://claude.ai/",
+            "Origin": "https://claude.ai",
+            "Sec-Ch-Ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         })
         self.session.cookies.set("sessionKey", session_key, domain="claude.ai")
 
@@ -79,9 +97,21 @@ class ClaudeAPI:
         ct = resp.headers.get("content-type", "")
         if "application/json" not in ct:
             raise ClaudeAPIError(
-                f"{action}: Cloudflare blocked the request (got HTML instead of JSON). "
-                "Try updating curl_cffi: pip install -U curl_cffi"
+                f"{action}: Cloudflare blocked the request "
+                f"(fingerprint={self._fp_used}). "
+                "Try downloading the latest version from GitHub."
             )
+
+    def _warmup(self):
+        """
+        Visit claude.ai homepage to obtain Cloudflare clearance cookies
+        (cf_clearance, __cf_bm, etc.) before making API calls.
+        This mimics a real browser navigating to the site first.
+        """
+        try:
+            self.session.get("https://claude.ai/", timeout=10)
+        except Exception:
+            pass  # Best-effort; API call may still work without it
 
     def get_organizations(self) -> list[dict]:
         """
@@ -90,6 +120,7 @@ class ClaudeAPI:
         Returns:
             List of org dicts, each containing at least "uuid" and "name".
         """
+        self._warmup()
         resp = self.session.get(f"{API_BASE}/organizations", timeout=30)
         self._check_response(resp, "Fetch organizations")
         return resp.json()
