@@ -93,6 +93,7 @@ class ClaudeAPI:
 
     def fetch_all(self, org_id: str) -> dict:
         raw = self.get_usage(org_id)
+        log.info(f"Raw API response: {raw}")
         return _parse_usage(raw)
 
 
@@ -101,11 +102,27 @@ class ClaudeAPI:
 # ---------------------------------------------------------------------------
 
 def _parse_usage(raw: dict) -> dict:
+    # Detect format: if ANY utilization value > 1, the API is returning
+    # percentages directly (0-100); otherwise it's fractions (0-1).
+    all_utils = []
+    for key in ("five_hour", "seven_day"):
+        period = raw.get(key) or {}
+        u = period.get("utilization")
+        if u is not None:
+            all_utils.append(float(u))
+
+    is_percentage = any(u > 1.0 for u in all_utils)
+    log.debug(f"Utilization values: {all_utils}, format={'pct' if is_percentage else 'frac'}")
+
     result = {}
     for key, label in [("five_hour", "5h Session"), ("seven_day", "7d Weekly")]:
         period = raw.get(key) or {}
         util = period.get("utilization")
         util = float(util) if util is not None else 0.0
+
+        pct = util if is_percentage else util * 100
+        pct = round(min(pct, 100.0), 1)
+
         reset = period.get("resets_at")
         reset_time = None
         if reset:
@@ -118,7 +135,7 @@ def _parse_usage(raw: dict) -> dict:
                 pass
         result[key] = {
             "label": label,
-            "percentage": round(util * 100, 1) if util <= 1.0 else round(util, 1),
+            "percentage": pct,
             "reset_time": reset_time,
         }
     return result
