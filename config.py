@@ -28,7 +28,9 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
+    "auth_mode": "",     # "session_key" or "oauth_token"
     "session_key": "",   # Encrypted with DPAPI before saving to disk
+    "oauth_token": "",   # Encrypted with DPAPI before saving to disk
     "org_id": "",        # Claude organization UUID
     "org_name": "",      # Claude organization display name
     "refresh_interval": 300,  # Auto-refresh interval in seconds (default 5min)
@@ -154,14 +156,19 @@ def load_config() -> dict:
             try:
                 config["session_key"] = _dpapi_decrypt(encrypted_key)
             except OSError:
-                # Decryption failed - key may be from a different user/machine
                 config["session_key"] = ""
 
-        # Migration: if there's a plaintext session_key but no encrypted one,
-        # this is an old config from before encryption was added.
-        # The key will be re-encrypted on next save_config() call.
+        # Migration: if there's a plaintext session_key but no encrypted one
         elif config.get("session_key", "").startswith("sk-ant-"):
             pass  # Keep plaintext key; it will be encrypted on next save
+
+        # Decrypt OAuth token if it's encrypted
+        encrypted_token = config.get("oauth_token_encrypted", "")
+        if encrypted_token:
+            try:
+                config["oauth_token"] = _dpapi_decrypt(encrypted_token)
+            except OSError:
+                config["oauth_token"] = ""
 
         return config
     except (json.JSONDecodeError, OSError):
@@ -183,15 +190,14 @@ def save_config(config: dict):
     # Build a copy for disk storage
     to_save = dict(config)
 
-    # Encrypt session key before saving
-    session_key = to_save.get("session_key", "")
-    if session_key:
-        to_save["session_key_encrypted"] = _dpapi_encrypt(session_key)
-    else:
-        to_save["session_key_encrypted"] = ""
-
-    # Never write plaintext session key to disk
-    to_save["session_key"] = ""
+    # Encrypt secrets before saving — plaintext NEVER written to disk
+    for field in ("session_key", "oauth_token"):
+        value = to_save.get(field, "")
+        if value:
+            to_save[f"{field}_encrypted"] = _dpapi_encrypt(value)
+        else:
+            to_save[f"{field}_encrypted"] = to_save.get(f"{field}_encrypted", "")
+        to_save[field] = ""
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(to_save, f, indent=2, ensure_ascii=False)

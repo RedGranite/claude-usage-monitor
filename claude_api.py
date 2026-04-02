@@ -1,28 +1,30 @@
 """
-Claude.ai API client for fetching usage data.
+Claude API client for fetching usage data.
 
-Authentication: Uses sessionKey cookie from claude.ai browser session.
-HTTP client: Uses curl_cffi to impersonate Chrome's TLS fingerprint,
-             which is necessary to bypass Cloudflare protection on claude.ai.
+Supports two authentication modes:
 
-API endpoints used:
-  - GET /api/organizations          → list user's organizations
-  - GET /api/organizations/{id}/usage → usage data (5h, 7d limits)
+  1. Session Key mode (claude.ai API):
+     - Uses sessionKey cookie from browser + curl_cffi to bypass Cloudflare.
+     - Endpoints: /api/organizations, /api/organizations/{id}/usage
+     - May be blocked by Cloudflare on some machines.
 
-Usage response format:
-  {
-    "five_hour":      {"utilization": 0.0-1.0, "resets_at": "ISO8601"},
-    "seven_day":      {"utilization": 0.0-1.0, "resets_at": "ISO8601"},
-    "seven_day_opus": {"utilization": 0.0-1.0, "resets_at": "ISO8601"},
-    "seven_day_sonnet": {"utilization": 0.0-1.0, "resets_at": "ISO8601"},
-  }
+  2. OAuth Token mode (api.anthropic.com — NO Cloudflare):
+     - Uses OAuth access_token from Claude Code CLI.
+     - Sends a minimal Messages API request and reads rate-limit headers.
+     - Headers: anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}
+     - Completely bypasses Cloudflare since it hits api.anthropic.com directly.
 """
 
 from __future__ import annotations
 
-from curl_cffi import requests
+import urllib.request
+import json
 from datetime import datetime, timezone
 
+
+# ---------------------------------------------------------------------------
+# Session Key mode (claude.ai) — uses curl_cffi for Cloudflare bypass
+# ---------------------------------------------------------------------------
 
 API_BASE = "https://claude.ai/api"
 
@@ -34,24 +36,18 @@ class ClaudeAPIError(Exception):
 
 class ClaudeAPI:
     """
-    Client for the claude.ai web API.
-
-    Args:
-        session_key: The sessionKey cookie value from an authenticated
-                     claude.ai browser session (starts with "sk-ant-sid").
+    Client for claude.ai web API using sessionKey cookie.
+    Requires curl_cffi for TLS fingerprint impersonation.
     """
 
-    # Chrome fingerprints to try, from newest to oldest.
-    # Available fingerprints vary by curl_cffi version.
     _FINGERPRINTS = ("chrome136", "chrome131", "chrome124", "chrome120", "chrome")
 
     def __init__(self, session_key: str):
+        from curl_cffi import requests
+
         self.session_key = session_key
         self._fp_used = "unknown"
 
-        # curl_cffi impersonates Chrome's TLS fingerprint to bypass Cloudflare.
-        # Standard Python `requests` gets blocked with a 403 challenge page.
-        # Try the latest Chrome fingerprint, fall back to older ones.
         for fp in self._FINGERPRINTS:
             try:
                 self.session = requests.Session(impersonate=fp)
@@ -60,10 +56,8 @@ class ClaudeAPI:
             except Exception:
                 continue
 
-        # Headers that mimic a real Chrome browser visiting claude.ai.
-        # Cloudflare checks these in combination with the TLS fingerprint.
         self.session.headers.update({
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://claude.ai/",
@@ -79,7 +73,6 @@ class ClaudeAPI:
         self.session.cookies.set("sessionKey", session_key, domain="claude.ai")
 
     def _check_response(self, resp, action: str):
-        """Validate HTTP response and raise ClaudeAPIError on failure."""
         if resp.status_code in (401, 403):
             try:
                 data = resp.json()
@@ -91,122 +84,168 @@ class ClaudeAPI:
             raise ClaudeAPIError(f"{action}: HTTP {resp.status_code} - {msg or resp.text[:100]}")
         if resp.status_code != 200:
             raise ClaudeAPIError(f"{action}: HTTP {resp.status_code}")
-
-        # Cloudflare may return 200 with an HTML challenge page instead of JSON.
-        # Detect this by checking Content-Type header.
         ct = resp.headers.get("content-type", "")
         if "application/json" not in ct:
             raise ClaudeAPIError(
                 f"{action}: Cloudflare blocked the request "
                 f"(fingerprint={self._fp_used}). "
-                "Try downloading the latest version from GitHub."
+                "Try switching to OAuth Token mode in settings."
             )
 
     def _warmup(self):
-        """
-        Visit claude.ai homepage to obtain Cloudflare clearance cookies
-        (cf_clearance, __cf_bm, etc.) before making API calls.
-        This mimics a real browser navigating to the site first.
-        """
         try:
             self.session.get("https://claude.ai/", timeout=10)
         except Exception:
-            pass  # Best-effort; API call may still work without it
+            pass
 
     def get_organizations(self) -> list[dict]:
-        """
-        Fetch the list of organizations for the authenticated user.
-
-        Returns:
-            List of org dicts, each containing at least "uuid" and "name".
-        """
         self._warmup()
         resp = self.session.get(f"{API_BASE}/organizations", timeout=30)
         self._check_response(resp, "Fetch organizations")
         return resp.json()
 
     def get_usage(self, org_id: str) -> dict:
-        """
-        Fetch raw usage data for a specific organization.
-
-        Args:
-            org_id: Organization UUID.
-
-        Returns:
-            Raw JSON response dict with five_hour, seven_day, etc.
-        """
         resp = self.session.get(f"{API_BASE}/organizations/{org_id}/usage", timeout=30)
         self._check_response(resp, "Fetch usage")
         return resp.json()
 
     def fetch_all(self, org_id: str) -> dict:
-        """
-        Fetch and parse usage into a structured result.
-
-        Returns:
-            Dict keyed by period name ("five_hour", "seven_day", etc.),
-            each containing "label", "percentage" (0-100), and "reset_time".
-        """
         raw = self.get_usage(org_id)
-        return self._parse_usage(raw)
+        return _parse_usage(raw)
 
-    # --- Parsing helpers ---
 
-    @staticmethod
-    def _parse_utilization(value) -> float:
+# ---------------------------------------------------------------------------
+# OAuth Token mode (api.anthropic.com) — NO Cloudflare
+# ---------------------------------------------------------------------------
+
+MESSAGES_API = "https://api.anthropic.com/v1/messages"
+
+
+class OAuthAPI:
+    """
+    Client that uses an OAuth access_token (from Claude Code CLI) to
+    fetch usage data via the Messages API rate-limit headers.
+
+    This completely bypasses Cloudflare since it hits api.anthropic.com.
+    It sends a minimal 1-token request to claude-haiku-4-5 and reads
+    the rate-limit headers from the response.
+    """
+
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+
+    def fetch_all(self, org_id: str = "") -> dict:
         """
-        Parse utilization value from API response.
-        The API may return int, float, or string representation.
-        Values are typically 0.0 to 1.0 (representing 0% to 100%).
+        Send a minimal Messages API request and parse rate-limit headers.
+        org_id is ignored (kept for interface compatibility).
         """
-        if value is None:
-            return 0.0
-        if isinstance(value, (int, float)):
-            return float(value)
+        body = json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+
+        req = urllib.request.Request(MESSAGES_API, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {self.access_token}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "claude-code/2.1.5")
+        req.add_header("anthropic-version", "2023-06-01")
+        req.add_header("anthropic-beta", "oauth-2025-04-20")
+
         try:
-            return float(value)
-        except (ValueError, TypeError):
-            return 0.0
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                headers = resp.headers
+        except urllib.error.HTTPError as e:
+            # 4xx/5xx still have headers we can read
+            if e.code == 401:
+                raise ClaudeAPIError("Invalid OAuth token - please update your token")
+            headers = e.headers
+            if headers is None:
+                raise ClaudeAPIError(f"Messages API: HTTP {e.code}")
+        except Exception as e:
+            raise ClaudeAPIError(f"Messages API request failed: {e}")
 
-    @staticmethod
-    def _parse_reset_time(value) -> datetime | None:
-        """
-        Parse reset timestamp from API response.
-        Handles both ISO 8601 strings and Unix timestamps.
-        """
-        if not value:
-            return None
-        try:
-            if isinstance(value, (int, float)):
-                return datetime.fromtimestamp(value, tz=timezone.utc)
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            return None
-
-    def _parse_usage(self, raw: dict) -> dict:
-        """
-        Parse raw API response into structured usage data.
-
-        Converts utilization (0.0-1.0) to percentage (0-100) and
-        parses reset timestamps into datetime objects.
-        """
+        # Parse rate-limit headers into the same format as session key mode
         result = {}
-        for key, label in [
-            ("five_hour", "5h Session"),     # 5-hour rolling window limit
-            ("seven_day", "7d Weekly"),       # 7-day overall limit
-            ("seven_day_opus", "7d Opus"),    # 7-day Opus model specific limit
-            ("seven_day_sonnet", "7d Sonnet"),# 7-day Sonnet model specific limit
+        for key, label, h_prefix in [
+            ("five_hour",  "5h Session", "anthropic-ratelimit-unified-5h"),
+            ("seven_day",  "7d Weekly",  "anthropic-ratelimit-unified-7d"),
         ]:
-            period = raw.get(key, {})
-            if period is None:
-                period = {}
-            utilization = self._parse_utilization(period.get("utilization"))
-            reset_time = self._parse_reset_time(period.get("resets_at"))
+            util_str = headers.get(f"{h_prefix}-utilization", "")
+            reset_str = headers.get(f"{h_prefix}-reset", "")
+
+            utilization = 0.0
+            if util_str:
+                try:
+                    utilization = float(util_str)
+                except (ValueError, TypeError):
+                    pass
+
+            reset_time = None
+            if reset_str:
+                try:
+                    reset_time = datetime.fromtimestamp(float(reset_str), tz=timezone.utc)
+                except (ValueError, TypeError):
+                    try:
+                        reset_time = datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        pass
+
             result[key] = {
                 "label": label,
-                # API returns 0.0-1.0; convert to percentage.
-                # If value > 1.0 it's already a percentage (edge case).
                 "percentage": round(utilization * 100, 1) if utilization <= 1.0 else round(utilization, 1),
                 "reset_time": reset_time,
             }
+
+        # Check if we got any data at all
+        if all(v["percentage"] == 0.0 and v["reset_time"] is None for v in result.values()):
+            raise ClaudeAPIError("No rate-limit headers received. Token may be invalid.")
+
         return result
+
+
+# ---------------------------------------------------------------------------
+# Shared parsing helpers (for session key mode)
+# ---------------------------------------------------------------------------
+
+def _parse_utilization(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_reset_time(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_usage(raw: dict) -> dict:
+    result = {}
+    for key, label in [
+        ("five_hour", "5h Session"),
+        ("seven_day", "7d Weekly"),
+        ("seven_day_opus", "7d Opus"),
+        ("seven_day_sonnet", "7d Sonnet"),
+    ]:
+        period = raw.get(key, {})
+        if period is None:
+            period = {}
+        utilization = _parse_utilization(period.get("utilization"))
+        reset_time = _parse_reset_time(period.get("resets_at"))
+        result[key] = {
+            "label": label,
+            "percentage": round(utilization * 100, 1) if utilization <= 1.0 else round(utilization, 1),
+            "reset_time": reset_time,
+        }
+    return result

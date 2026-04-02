@@ -28,7 +28,7 @@ import ctypes
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
-from claude_api import ClaudeAPI, ClaudeAPIError
+from claude_api import ClaudeAPI, OAuthAPI, ClaudeAPIError
 from config import load_config, save_config, CONFIG_DIR
 
 from typing import Optional
@@ -182,8 +182,8 @@ class UsageMonitor:
 
     def __init__(self):
         self.config = load_config()
-        self.api: Optional[ClaudeAPI] = None
-        self.usage: Optional[dict] = None       # Parsed usage data from API
+        self.api = None                          # ClaudeAPI or OAuthAPI instance
+        self.usage: Optional[dict] = None        # Parsed usage data from API
         self.last_error: Optional[str] = None    # Last error message for UI display
         self.icon: Optional[pystray.Icon] = None
         self.running = True                      # Controls background thread lifecycle
@@ -191,8 +191,17 @@ class UsageMonitor:
         self._popup_open = False                 # Prevents multiple dashboard windows
         self._popup_pinned = False               # Dashboard "always on top" state
 
-        if self.config["session_key"]:
+        self._init_api()
+
+    def _init_api(self):
+        """Initialize the API client based on the configured auth mode."""
+        mode = self.config.get("auth_mode", "")
+        if mode == "oauth_token" and self.config.get("oauth_token"):
+            self.api = OAuthAPI(self.config["oauth_token"])
+        elif self.config.get("session_key"):
             self.api = ClaudeAPI(self.config["session_key"])
+            if not mode:
+                self.config["auth_mode"] = "session_key"
 
     # -----------------------------------------------------------------------
     # Tray icon rendering
@@ -307,7 +316,7 @@ class UsageMonitor:
         items.append(pystray.MenuItem("Show Dashboard", self._on_show_popup, default=True))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Refresh Now", self._on_refresh))
-        items.append(pystray.MenuItem("Set Session Key...", self._on_set_key))
+        items.append(pystray.MenuItem("Set Auth Token...", self._on_set_auth))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False))
         items.append(pystray.MenuItem("Quit", self._on_quit))
@@ -477,9 +486,9 @@ class UsageMonitor:
         """Trigger an immediate usage data refresh."""
         threading.Thread(target=self._refresh_usage, daemon=True).start()
 
-    def _on_set_key(self, icon=None, item=None):
-        """Prompt user to enter a new session key (restarts tray icon)."""
-        threading.Thread(target=self._prompt_session_key_from_tray, daemon=True).start()
+    def _on_set_auth(self, icon=None, item=None):
+        """Prompt user to enter new auth credentials (restarts tray icon)."""
+        threading.Thread(target=self._prompt_auth_from_tray, daemon=True).start()
 
     def _on_quit(self, icon=None, item=None):
         """Clean shutdown: stop threads, remove lock, exit tray."""
@@ -489,52 +498,94 @@ class UsageMonitor:
             self.icon.stop()
 
     # -----------------------------------------------------------------------
-    # Session key management
+    # Authentication management
     # -----------------------------------------------------------------------
 
-    def _prompt_session_key_sync(self) -> bool:
+    def _prompt_auth_sync(self) -> bool:
         """
-        Show a modal dialog asking the user to paste their sessionKey.
+        Show a dialog letting the user choose auth mode and enter credentials.
 
-        Must be called from the main thread (before tray icon starts)
-        because tkinter requires the main thread for its event loop.
+        Two modes:
+          1. Session Key — from claude.ai cookies (may be blocked by Cloudflare)
+          2. OAuth Token — from Claude Code CLI (no Cloudflare, recommended)
 
         Returns:
-            True if a key was entered and saved, False if cancelled.
+            True if credentials were entered and saved, False if cancelled.
         """
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        key = simpledialog.askstring(
-            "Claude Usage Monitor",
-            "Enter your sessionKey (from claude.ai cookies):\n\n"
-            "How to get it:\n"
-            "1. Open claude.ai in your browser\n"
-            "2. Press F12 -> Application -> Cookies\n"
-            "3. Copy the value of 'sessionKey'",
+
+        # Ask which auth mode to use
+        answer = messagebox.askyesno(
+            "Claude Usage Monitor — Authentication",
+            "Choose authentication method:\n\n"
+            "YES = OAuth Token (recommended, no Cloudflare issues)\n"
+            "  → From Claude Code CLI config\n\n"
+            "NO = Session Key (from browser cookies)\n"
+            "  → May be blocked by Cloudflare on some machines",
             parent=root,
         )
+
+        if answer:
+            # OAuth Token mode
+            token = simpledialog.askstring(
+                "Claude Usage Monitor — OAuth Token",
+                "Enter your OAuth access_token:\n\n"
+                "How to get it:\n"
+                "1. Open file: %APPDATA%\\claude-code\\auth.json\n"
+                "   (or ~/.config/claude-code/auth.json on Mac/Linux)\n"
+                "2. Copy the value of 'accessToken'",
+                parent=root,
+            )
+            root.destroy()
+            if token and token.strip():
+                token = token.strip()
+                log.info(f"OAuth token received (length={len(token)})")
+                self.config["auth_mode"] = "oauth_token"
+                self.config["oauth_token"] = token
+                self.api = OAuthAPI(token)
+                try:
+                    save_config(self.config)
+                    log.info("Config saved with OAuth token.")
+                except Exception as e:
+                    log.error(f"Error saving config: {e}", exc_info=True)
+                return True
+        else:
+            # Session Key mode
+            key = simpledialog.askstring(
+                "Claude Usage Monitor — Session Key",
+                "Enter your sessionKey (from claude.ai cookies):\n\n"
+                "How to get it:\n"
+                "1. Open claude.ai in your browser\n"
+                "2. Press F12 -> Application -> Cookies\n"
+                "3. Copy the value of 'sessionKey'",
+                parent=root,
+            )
+            root.destroy()
+            if key and key.strip():
+                key = key.strip()
+                log.info(f"Session key received (length={len(key)})")
+                self.config["auth_mode"] = "session_key"
+                self.config["session_key"] = key
+                self.api = ClaudeAPI(key)
+                try:
+                    self._auto_select_org()
+                    save_config(self.config)
+                    log.info(f"Config saved. org_id={self.config.get('org_id')}")
+                except Exception as e:
+                    log.error(f"Error after setting key: {e}", exc_info=True)
+                    self.last_error = str(e)
+                return True
+
         root.destroy()
-        if key and key.strip():
-            key = key.strip()
-            log.info(f"Session key received (length={len(key)})")
-            self.config["session_key"] = key
-            self.api = ClaudeAPI(key)
-            try:
-                self._auto_select_org()
-                save_config(self.config)  # Key is encrypted via DPAPI before saving
-                log.info(f"Config saved. org_id={self.config.get('org_id')}, org_name={self.config.get('org_name')}")
-            except Exception as e:
-                log.error(f"Error after setting key: {e}", exc_info=True)
-                self.last_error = str(e)
-            return True
         return False
 
-    def _prompt_session_key_from_tray(self, icon=None, item=None):
-        """Re-prompt for session key while the app is running. Restarts the tray icon."""
+    def _prompt_auth_from_tray(self, icon=None, item=None):
+        """Re-prompt for auth while the app is running. Restarts the tray icon."""
         if self.icon:
             self.icon.stop()
-        self._prompt_session_key_sync()
+        self._prompt_auth_sync()
         self._refresh_usage()
         self._start_tray()
 
@@ -566,12 +617,16 @@ class UsageMonitor:
 
     def _refresh_usage(self):
         """Fetch latest usage data from the API and update the tray icon."""
-        if not self.api or not self.config.get("org_id"):
-            log.debug(f"Skipping refresh: api={self.api is not None}, org_id={self.config.get('org_id')}")
+        if not self.api:
+            log.debug("Skipping refresh: no API client")
+            return
+        # Session key mode needs org_id; OAuth mode does not
+        if isinstance(self.api, ClaudeAPI) and not self.config.get("org_id"):
+            log.debug("Skipping refresh: session_key mode but no org_id")
             return
         try:
             log.info("Refreshing usage data...")
-            self.usage = self.api.fetch_all(self.config["org_id"])
+            self.usage = self.api.fetch_all(self.config.get("org_id", ""))
             self.last_error = None
             log.info(f"Usage refreshed: {self.usage}")
         except ClaudeAPIError as e:
@@ -649,8 +704,9 @@ class UsageMonitor:
         log.info("Tray icon stopped.")
 
     def _ensure_org(self):
-        """Fetch organization info if we have a key but no org_id (e.g. after migration)."""
-        if self.api and not self.config.get("org_id"):
+        """Fetch organization info if we have a session key but no org_id."""
+        # OAuth mode doesn't need org_id
+        if isinstance(self.api, ClaudeAPI) and not self.config.get("org_id"):
             log.info("org_id missing, fetching organizations...")
             self._auto_select_org()
             if self.config.get("org_id"):
@@ -666,16 +722,17 @@ class UsageMonitor:
           5. Run tray icon (blocks until quit)
         """
         log.info(f"=== Claude Usage Monitor v{APP_VERSION} starting ===")
-        log.info(f"Config: session_key={'set' if self.config['session_key'] else 'empty'}, org_id={self.config.get('org_id')}")
+        auth_mode = self.config.get("auth_mode", "none")
+        log.info(f"Config: auth_mode={auth_mode}, org_id={self.config.get('org_id')}")
         log.info(f"Log file: {LOG_FILE}")
 
         # Step 0: Check for updates on GitHub
         check_for_update()
 
-        # Step 1: Ensure we have a session key
-        if not self.config["session_key"]:
-            if not self._prompt_session_key_sync():
-                log.info("No session key provided, exiting.")
+        # Step 1: Ensure we have credentials
+        if not self.api:
+            if not self._prompt_auth_sync():
+                log.info("No credentials provided, exiting.")
                 return
 
         # Step 2: Ensure we have an organization selected
