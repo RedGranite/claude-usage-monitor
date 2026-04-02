@@ -1,4 +1,4 @@
-# Claude Usage Monitor
+# Claude Usage Monitor Win
 
 A Windows system tray application that monitors your [Claude.ai](https://claude.ai) usage limits in real time.
 
