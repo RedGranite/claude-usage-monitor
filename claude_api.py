@@ -48,7 +48,7 @@ class ClaudeAPI:
         # Standard Python `requests` gets blocked with a 403 challenge page.
         # Try the latest Chrome fingerprint, fall back to generic "chrome"
         # if the specific version isn't available in the installed curl_cffi.
-        for fp in ("chrome130", "chrome124", "chrome120", "chrome"):
+        for fp in ("chrome136", "chrome131", "chrome124", "chrome120", "chrome"):
             try:
                 self.session = requests.Session(impersonate=fp)
                 break
